@@ -3,7 +3,7 @@
 # vim: set foldmethod=marker:
 #
 
-set -x
+#set -x
 #set -v
 
 ansible_user="ansible"
@@ -46,7 +46,7 @@ get_pw() {
 key_auth_available() {
     local user_host=$1
     if [[ -z ${_key_auth_available[${user_host}]} ]] ; then
-        ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o StrictHostKeyChecking=no ${user_host} 'exit' 2>/dev/null
+        ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o ChallengeResponseAuthentication=no -o NumberOfPasswordPrompts=0 -o StrictHostKeyChecking=no ${user_host} 'exit' 2>/dev/null
         _key_auth_available[${user_host}]=$?
         #echo "_key_auth_available=${_key_auth_available[$user_host]}"
     fi
