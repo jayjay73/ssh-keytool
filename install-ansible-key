@@ -1,0 +1,153 @@
+#!/bin/bash
+#
+# vim: set foldmethod=marker:
+#
+
+set -x
+#set -v
+
+ansible_user="ansible"
+
+
+if [[ $# -lt 1 ]] ; then
+    echo "$0: copies ansibles public key to hosts /root/.ssh/authorized_keys."
+    echo "Usage: $0 <list of server names>"
+    exit
+fi
+
+
+declare passwd
+declare -A _key_auth_available
+declare -A _passwordless_sudo_available
+script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+get_home_dir_for_user() {
+    awk -F':' "/$1/ {print \$6}" /etc/passwd
+}
+
+get_pw() {
+    # don't use first in a subshell.
+    # it works, but the password doesn't propagate to the global var.
+    if [[ -z ${passwd} ]] ; then
+        echo -n "Whatsda PASSWORD(user: $user)? " >&2
+        stty -echo
+        read passwd
+        stty echo
+        echo >&2
+	SSH_AUTH_SOCK= sshpass -p "${passwd}" ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${user}@localhost true 2>/dev/null
+	if [[ $? -ne 0 ]] ; then
+	    echo "Could not log in. Incorrect password? exiting." >&2
+            exit 1
+        fi
+        echo "Password OK." >&2
+    fi
+}
+
+key_auth_available() {
+    local user_host=$1
+    if [[ -z ${_key_auth_available[${user_host}]} ]] ; then
+        ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o StrictHostKeyChecking=no ${user_host} 'exit' 2>/dev/null
+        _key_auth_available[${user_host}]=$?
+        #echo "_key_auth_available=${_key_auth_available[$user_host]}"
+    fi
+    return ${_key_auth_available[${user_host}]}
+}
+
+passwordless_sudo_available() {
+    local user_host=$1
+    if [[ -z ${_passwordless_sudo_available[${user_host}]} ]] ; then
+        if key_auth_available ${user_host} ; then
+            ssh -q -o ConnectTimeout=3 ${user_host} "sudo -n -u root true" 2>/dev/null
+            _passwordless_sudo_available[${user_host}]=$?
+        else
+            [[ -z ${passwd} ]] && echo "need password to ssh to ${user_host}." >&2
+            get_pw
+            sshpass -p "${passwd}" ssh -q -o ConnectTimeout=3 ${user_host} "sudo -n -u root true" 2>/dev/null
+            _passwordless_sudo_available[${user_host}]=$?
+        fi
+    fi
+    return ${_passwordless_sudo_available[${user_host}]}
+}
+
+exec_remote_sudo() {
+    local user_host=$1
+    local remote_cmd=$2
+    if key_auth_available ${user_host} ; then
+        if passwordless_sudo_available ${user_host} ; then
+            ssh -q -o ConnectTimeout=3 ${user_host} "sudo 2>/dev/null sh -c \"${remote_cmd}\""
+            return $?
+        else
+            #echo "b4 get_pw in exec_remote_sudo"
+            [[ -z ${passwd} ]] && echo "need password to attain root on ${user_host}." >&2
+            get_pw
+            ssh -q -o ConnectTimeout=3 ${user_host} "echo '$passwd' | sudo -S 2>/dev/null sh -c \"${remote_cmd}\""
+            return $?
+        fi
+    else
+        #echo "b4 get_pw in exec_remote_sudo"
+        [[ -z ${passwd} ]] && echo "need password to ssh to ${user_host}." >&2
+        get_pw
+        if passwordless_sudo_available ${user_host} ; then
+            sshpass -p "${passwd}" ssh -q -o ConnectTimeout=3 ${user_host} "sudo 2>/dev/null sh -c \"${remote_cmd}\""
+            return $?
+        else
+            sshpass -p "${passwd}" ssh -q -o ConnectTimeout=3 ${user_host} "echo '$passwd' | sudo -S 2>/dev/null sh -c \"${remote_cmd}\""
+            return $?
+        fi
+    fi
+}
+
+
+# retrieve the ansible user's ssh pub key
+ansible_home=$( get_home_dir_for_user ${ansible_user} )
+if [[ "${USER}" == "${ansible_user}" ]] ; then
+    # if we are running as ansible user get ssh pubkey.
+    user=$( who am i | awk '{print $1}' )
+    ssh_key_pub=$( cat ${ansible_home}/.ssh/id_rsa.pub )
+else
+    user=${USER}
+    # we are not ansible user. try to sudo, get passwd if necessary.
+    sudo -n -u ${ansible_user} true
+    if [[ $? -eq 0 ]] ; then
+        ssh_key_pub=$( sudo -u ${ansible_user} cat ${ansible_home}/.ssh/id_rsa.pub )
+    else
+        # try to sudo with passwd.
+        #echo "b4 get_pw in main"
+        [[ -z ${passwd} ]] && echo "need password to sudo to ${ansible_user} on ${user_host}." >&2
+        get_pw
+        echo "${passwd}" | sudo -vSu ${ansible_user} 2>/dev/null
+        if [[ $? -ne 0 ]] ; then
+            echo "could not sudo to ${ansible_user} to retrieve key. exiting."
+            exit 1
+        else
+            ssh_key_pub=$( echo "${passwd}" | sudo -Su ${ansible_user} cat ${ansible_home}/.ssh/id_rsa.pub )
+        fi
+    fi
+fi
+
+for host in "$@" ; do
+    ssh_key_comment=$( echo ${ssh_key_pub} | awk '{print $NF }' )
+    if ! host ${host} >/dev/null ; then
+        echo "Not a host: ${host}."
+        continue
+    fi
+    if ! tcping -t 3 ${host} 22 >/dev/null ; then 
+        echo "Could not reach port 22 on ${host}. Host down?"
+        continue
+    fi
+    exec_remote_sudo "${user}@${host}" "grep ${ssh_key_comment} /root/.ssh/authorized_keys" >/dev/null
+    #echo $?
+    if [[ $? -eq 0 ]] ; then
+        echo "${host}: key already present."
+        continue
+    else
+        echo "${host}: installing key for user ${ansible_user}"
+        exec_remote_sudo "${user}@${host}" "echo '${ssh_key_pub}' >>/root/.ssh/authorized_keys"
+        if [[ $? -ne 0 ]] ; then
+            echo "there were errors installing key on ${host}."
+        fi
+        at_command="sed -i '/${ssh_key_comment}/d' /root/.ssh/authorized_keys"
+        exec_remote_sudo "${user}@${host}" "echo ${at_command} | at midnight + 2 hours"
+    fi
+done
+
